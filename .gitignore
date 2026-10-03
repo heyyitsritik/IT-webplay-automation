@@ -1,0 +1,7 @@
+.env
+node_modules/
+recordings/
+catalog*.json
+.DS_Store
+__pycache__/
+*.pyc
