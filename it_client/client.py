@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 
 import websockets
 
+from .auth import center_login, Session
 from .codec import decode_server_frame, encode_client_frame
 
 PushHandler = Callable[[dict], Awaitable[None] | None]
@@ -49,8 +50,14 @@ def status_of(msg: Any) -> int | None:
 
 
 class GameClient:
-    def __init__(self, url: str, *, history: int = 500) -> None:
-        self.url = url
+    def __init__(
+        self,
+        session: Session,
+        *,
+        history: int = 500,
+    ) -> None:
+        self.session = session
+        self.url = session.ws_url
         self._ws: Any = None
         self._reader: asyncio.Task | None = None
         self._next_req = 1
@@ -67,7 +74,10 @@ class GameClient:
         await self.close()
 
     async def connect(self) -> None:
-        self._ws = await websockets.connect(self.url, max_size=None)
+        self._ws = await websockets.connect(
+            self.url,
+            max_size=None,
+        )
         self._reader = asyncio.create_task(self._read_loop())
 
     async def close(self) -> None:
@@ -82,40 +92,90 @@ class GameClient:
     async def send(self, obj: dict) -> None:
         await self._ws.send(encode_client_frame(obj))
 
-    async def request(self, route: str, timeout: float = 15.0, **params: Any) -> dict:
+    async def request(
+        self,
+        route: str,
+        timeout: float = 15.0,
+        **params: Any,
+    ) -> dict:
         """Send {'route': route, 'reqId': n, **params} and wait for the matching reply."""
         req_id = self._next_req
         self._next_req += 1
+
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
+
         try:
-            await self.send({**params, "reqId": req_id, "route": route})
+            await self.send(
+                {
+                    **params,
+                    "reqId": req_id,
+                    "route": route,
+                }
+            )
             return await asyncio.wait_for(fut, timeout)
         finally:
             self._pending.pop(req_id, None)
 
-    async def expect(self, topic: str, timeout: float = 15.0) -> dict:
-        """Wait for the next message with this topic (e.g. the first 'push.msg')."""
+    async def expect(
+        self,
+        topic: str,
+        timeout: float = 15.0,
+    ) -> dict:
+        """Wait for the next message with this topic."""
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         entry = (topic, fut)
         self._waiters.append(entry)
+
         try:
             return await asyncio.wait_for(fut, timeout)
         finally:
             if entry in self._waiters:
                 self._waiters.remove(entry)
 
-    async def authenticate(self, access_token: str, timeout: float = 15.0) -> dict:
-        """First packet after connecting; your Node test got a 'push.msg' with player info back."""
-        waiter = asyncio.create_task(self.expect("push.msg", timeout))
-        await self.send({"accessToken": access_token})
-        return await waiter
+    async def authenticate(
+        self,
+        http,
+        timeout: float = 15.0,
+    ) -> dict:
+        """
+        Refresh the server hash from centerLogin and send g.enter.
+        A fresh hash is obtained for every authentication/reconnect.
+        """
+        server_hash, ws_url = await center_login(
+            http,
+            self.session.access_token,
+            self.session.server_id,
+        )
 
-    async def enter(self, server_id: int, hash_: str, version: str = "7.6.3") -> dict:
-        return await self.request("g.enter", sId=server_id, hash=hash_, ver=version)
+        self.session.server_hash = server_hash
+        self.session.ws_url = ws_url
+        self.url = ws_url
+
+        return await self.enter(
+            self.session.server_id,
+            server_hash,
+            version="7.6.3",
+        )
+
+    async def enter(
+        self,
+        server_id: int,
+        hash_: str,
+        version: str = "7.6.3",
+    ) -> dict:
+        return await self.request(
+            "g.enter",
+            sId=server_id,
+            hash=hash_,
+            ver=version,
+        )
 
     @staticmethod
-    async def pause(lo: float = 0.4, hi: float = 1.6) -> None:
+    async def pause(
+        lo: float = 0.4,
+        hi: float = 1.6,
+    ) -> None:
         """Human-ish pacing between actions."""
         await asyncio.sleep(random.uniform(lo, hi))
 
@@ -124,34 +184,46 @@ class GameClient:
             async for raw in self._ws:
                 if isinstance(raw, str):
                     continue
+
                 try:
                     messages = decode_server_frame(raw)
                 except ValueError:
                     self.events.append({"undecodable": raw.hex()})
                     continue
+
                 for msg in messages:
                     await self._dispatch(msg)
+
         except websockets.ConnectionClosed:
             pass
+
         finally:
             err = GameError("connection closed")
+
             for fut in list(self._pending.values()):
                 if not fut.done():
                     fut.set_exception(err)
 
     async def _dispatch(self, msg: dict) -> None:
         self.events.append(msg)
+
         rid = req_id_of(msg)
         fut = self._pending.get(rid) if rid is not None else None
+
         if fut is not None and not fut.done():
             fut.set_result(msg)
+
         topic = topic_of(msg)
+
         if topic is None:
             return
+
         for t, waiter in list(self._waiters):
             if t == topic and not waiter.done():
                 waiter.set_result(msg)
+
         for handler in self._handlers.get(topic, []):
             res = handler(msg)
+
             if asyncio.iscoroutine(res):
                 await res

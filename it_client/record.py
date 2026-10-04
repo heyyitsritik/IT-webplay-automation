@@ -79,8 +79,11 @@ async def main() -> None:
                 "hex": payload.hex()
             })
 
-    async with httpx.AsyncClient(timeout=20) as http:
-        session = await login(http, user, password)
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0),
+        headers={"User-Agent": "Mozilla/5.0"},
+        ) as http:
+        session = await login(http, user, password, parse_zone(args.zone)[1])
 
     url = game_url(session.access_token, region)
 
